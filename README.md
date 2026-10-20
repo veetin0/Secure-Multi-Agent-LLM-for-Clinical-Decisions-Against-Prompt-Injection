@@ -87,3 +87,22 @@ Changes to `utils.py`:
 4. `pptree` is optional (it does not install on current Python), and one f-string
    that needs Python 3.12 is fixed.
 5. `TRACE` records what happened inside a question (see the result record above)
+
+Upstream behaviour **left as published**:
+
+- If no agent wants to talk in round 1, the
+  loop exits with no final answers and the moderator is asked to "take majority
+  vote" over the text `None`. `trace.moderator_got_none` records when this happens.
+- `round_opinions` is only filled for round 1, so the summary agent has no input
+  from round 2 onward.
+- The advanced path computes `assessment_report` and `compiled_report` and then discards them.
+
+## Known limits
+
+- The 4B results use a small sample and one seed. They validate the pipeline;
+  they are not the final numbers.
+- `data/medqa` has no training split, so the few-shot examples MDAgents
+  normally uses are absent and prompts differ from the published setup.
+- Two upstream defects are left unfixed on purpose so the baseline matches the
+  published system (see "Changes from upstream"). One of them can leave the final moderator
+  with no agent answers; each run records how often that happens.
