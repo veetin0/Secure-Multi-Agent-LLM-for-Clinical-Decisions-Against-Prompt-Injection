@@ -4,10 +4,40 @@ import random
 from tqdm import tqdm
 from prettytable import PrettyTable 
 from termcolor import cprint
-from pptree import Node
-import google.generativeai as genai
+try:
+    from pptree import Node, print_tree
+except Exception:
+    class Node:
+        def __init__(self, name, parent=None):
+            self.name, self.parent, self.children = name, parent, []
+            if parent is not None:
+                parent.children.append(self)
+
+    def print_tree(node, *a, **k):
+        def walk(n, d=0):
+            print("  " * d + "- " + n.name)
+            for c in getattr(n, "children", []):
+                walk(c, d + 1)
+        walk(node)
+
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
+
 from openai import OpenAI
-from pptree import *
+import medgemma_backend as mg
+
+# When False, answer options are presented in their labelled order (A, B, C, D)
+# instead of upstream's shuffled order. Upstream shuffles the display order
+# while keeping the letters attached, which smaller models can mis-map: they
+# re-letter by position and give the right content under the wrong letter.
+SHUFFLE_OPTIONS = True
+
+# What happened inside the last question, recorded by main.py with the result.
+# Upstream logs none of this, so a "multi-agent" answer could not be told apart
+# from one where the debate never took place.
+TRACE = {}
 
 class Agent:
     def __init__(self, instruction, role, examplers=None, model_info='gpt-4o-mini', img_path=None):
@@ -16,7 +46,13 @@ class Agent:
         self.model_info = model_info
         self.img_path = img_path
 
-        if self.model_info == 'gemini-pro':
+        if mg.is_medgemma(self.model_info):
+            self.messages = [{"role": "system", "content": instruction}]
+            if examplers is not None:
+                for exampler in examplers:
+                    self.messages.append({"role": "user", "content": exampler['question']})
+                    self.messages.append({"role": "assistant", "content": exampler['answer'] + "\n\n" + exampler['reason']})
+        elif self.model_info == 'gemini-pro':
             self.model = genai.GenerativeModel('gemini-pro')
             self._chat = self.model.start_chat(history=[])
         elif self.model_info in ['gpt-3.5', 'gpt-4', 'gpt-4o', 'gpt-4o-mini']:
@@ -30,6 +66,12 @@ class Agent:
                     self.messages.append({"role": "assistant", "content": exampler['answer'] + "\n\n" + exampler['reason']})
 
     def chat(self, message, img_path=None, chat_mode=True):
+        if mg.is_medgemma(self.model_info):
+            self.messages.append({"role": "user", "content": message})
+            reply = mg.chat_completion(self.messages)
+            self.messages.append({"role": "assistant", "content": reply})
+            return reply
+
         if self.model_info == 'gemini-pro':
             for _ in range(10):
                 try:
@@ -59,6 +101,12 @@ class Agent:
             return response.choices[0].message.content
 
     def temp_responses(self, message, img_path=None):
+        if mg.is_medgemma(self.model_info):
+            self.messages.append({"role": "user", "content": message})
+            reply = mg.chat_completion(self.messages)
+            self.messages.append({"role": "assistant", "content": reply})
+            return {0.0: reply}
+
         if self.model_info in ['gpt-3.5', 'gpt-4', 'gpt-4o', 'gpt-4o-mini']:      
             self.messages.append({"role": "user", "content": message})
             
@@ -88,11 +136,11 @@ class Agent:
             return responses
 
 class Group:
-    def __init__(self, goal, members, question, examplers=None):
+    def __init__(self, goal, members, question, examplers=None, model_info='gpt-4o-mini'):
         self.goal = goal
         self.members = []
         for member_info in members:
-            _agent = Agent('You are a {} who {}.'.format(member_info['role'], member_info['expertise_description'].lower()), role=member_info['role'], model_info='gpt-4o-mini')
+            _agent = Agent('You are a {} who {}.'.format(member_info['role'], member_info['expertise_description'].lower()), role=member_info['role'], model_info=model_info)
             _agent.chat('You are a {} who {}.'.format(member_info['role'], member_info['expertise_description'].lower()))
             self.members.append(_agent)
         self.question = question
@@ -175,32 +223,112 @@ def parse_hierarchy(info, emojis):
 
     return agents
 
-def parse_group_info(group_info):
-    lines = group_info.split('\n')
-    
-    parsed_info = {
-        'group_goal': '',
-        'members': []
-    }
 
-    parsed_info['group_goal'] = "".join(lines[0].split('-')[1:])
-    
-    for line in lines[1:]:
-        if line.startswith('Member'):
-            member_info = line.split(':')
-            member_role_description = member_info[1].split('-')
-            
-            member_role = member_role_description[0].strip()
-            member_expertise = member_role_description[1].strip() if len(member_role_description) > 1 else ''
-            
-            parsed_info['members'].append({
-                'role': member_role,
-                'expertise_description': member_expertise
-            })
-    
+def parse_recruited(recruited, max_agents=5):
+    """
+    Parse the recruiter's free-text roster into (role, description, hierarchy).
+
+    Upstream assumed the model always answers in exactly the prompted format
+    ("1. Cardiologist - Focuses on ... - Hierarchy: Independent") and indexed
+    into split('-')[1] without guarding, so any deviation raised IndexError.
+    Smaller models deviate often: markdown bullets, bold, colons instead of
+    hyphens, or a lead-in sentence. We accept those shapes and skip anything
+    that is clearly not an agent line.
+    """
+    import re
+
+    agents = []
+    for raw in (recruited or "").split('\n'):
+        line = raw.strip()
+        if not line:
+            continue
+
+        # Separate the optional "- Hierarchy: ..." tail.
+        hierarchy = None
+        m = re.split(r'\s*-\s*Hierarchy\s*:\s*', line, flags=re.I)
+        if len(m) > 1:
+            line, hierarchy = m[0].strip(), m[1].strip()
+
+        # Strip list markers, numbering and markdown emphasis.
+        line = re.sub(r'^\s*(?:[-*\u2022]|\d+[.)])\s*', '', line)
+        line = line.replace('**', '').replace('__', '').strip()
+        if not line:
+            continue
+
+        # Split role from description on the first ' - ' or ': '.
+        parts = re.split(r'\s+-\s+|\s*:\s+', line, maxsplit=1)
+        role = parts[0].strip().rstrip('.').lower()
+        description = parts[1].strip().lower() if len(parts) > 1 else "contributes relevant medical expertise"
+
+        # Reject obvious non-agent lines (prose, headers, over-long roles).
+        if not role or len(role.split()) > 6 or role.endswith(('?', '!')):
+            continue
+        if any(role.startswith(w) for w in (
+                'here', 'sure', 'okay', 'the following', 'experts', 'team',
+                'note', 'answer', 'question', 'i ', 'we ')):
+            continue
+
+        agents.append((role, description, hierarchy))
+        if len(agents) >= max_agents:
+            break
+
+    return agents
+
+
+DEFAULT_ROSTER = [
+    ("internist", "focuses on general internal medicine and differential diagnosis", None),
+    ("clinical pharmacologist", "focuses on drug mechanisms and adverse effects", None),
+    ("pathologist", "focuses on laboratory findings and disease mechanisms", None),
+]
+
+def parse_group_info(group_info):
+    """
+    Parse one MDT block from the recruiter's output.
+
+    Guarded the same way as parse_recruited: upstream indexed into
+    split(':')[1] and required every member line to start with "Member",
+    which smaller models do not reliably produce. A group that ends up with
+    no members is returned empty and skipped by the caller rather than
+    crashing the run.
+    """
+    import re
+
+    lines = (group_info or "").split('\n')
+    parsed_info = {'group_goal': '', 'members': []}
+
+    first = lines[0] if lines else ''
+    goal_parts = first.split('-')[1:]
+    parsed_info['group_goal'] = "".join(goal_parts).strip() or first.strip()
+
+    for raw in lines[1:]:
+        line = raw.strip().replace('**', '')
+        if not line:
+            continue
+        # Accept "Member 1: Role - desc", "1. Role - desc", "- Role: desc"
+        if re.match(r'^member\s*\d*\s*[:.]', line, flags=re.I):
+            line = re.split(r'[:.]', line, maxsplit=1)[1].strip()
+        elif re.match(r'^\s*(?:[-*\u2022]|\d+[.)])\s*', line):
+            line = re.sub(r'^\s*(?:[-*\u2022]|\d+[.)])\s*', '', line).strip()
+        else:
+            continue
+        if not line:
+            continue
+
+        parts = re.split(r'\s+-\s+|\s*:\s+', line, maxsplit=1)
+        role = parts[0].strip()
+        expertise = parts[1].strip() if len(parts) > 1 else 'contributes relevant medical expertise'
+        if not role or len(role.split()) > 8:
+            continue
+        parsed_info['members'].append({
+            'role': role,
+            'expertise_description': expertise,
+        })
+
     return parsed_info
 
 def setup_model(model_name):
+    if mg.is_medgemma(model_name):
+        return None, mg.get_client()
     if 'gemini' in model_name:
         genai.configure(api_key=os.environ['genai_api_key'])
         return genai, None
@@ -210,19 +338,24 @@ def setup_model(model_name):
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
-def load_data(dataset):
-    test_qa = []
-    examplers = []
+def load_data(dataset, data_root=None):
+    root = data_root or os.environ.get('MDAGENTS_DATA', '../data')
+    test_path = os.path.join(root, dataset, 'test.jsonl')
+    train_path = os.path.join(root, dataset, 'train.jsonl')
 
-    test_path = f'../data/{dataset}/test.jsonl'
+    test_qa, examplers = [], []
     with open(test_path, 'r') as file:
         for line in file:
-            test_qa.append(json.loads(line))
+            if line.strip():
+                test_qa.append(json.loads(line))
 
-    train_path = f'../data/{dataset}/train.jsonl'
-    with open(train_path, 'r') as file:
-        for line in file:
-            examplers.append(json.loads(line))
+    if os.path.exists(train_path):
+        with open(train_path, 'r') as file:
+            for line in file:
+                if line.strip():
+                    examplers.append(json.loads(line))
+    else:
+        print(f"[warn] no {train_path}: running without few-shot examplers.")
 
     return test_qa, examplers
 
@@ -230,20 +363,21 @@ def create_question(sample, dataset):
     if dataset == 'medqa':
         question = sample['question'] + " Options: "
         options = []
-        for k, v in sample['options'].items():
+        for k, v in sorted(sample['options'].items()):
             options.append("({}) {}".format(k, v))
-        random.shuffle(options)
+        if SHUFFLE_OPTIONS:
+            random.shuffle(options)
         question += " ".join(options)
         return question, None
     return sample['question'], None
 
-def determine_difficulty(question, difficulty):
+def determine_difficulty(question, difficulty, model='gpt-3.5'):
     if difficulty != 'adaptive':
         return difficulty
     
     difficulty_prompt = f"""Now, given the medical query as below, you need to decide the difficulty/complexity of it:\n{question}.\n\nPlease indicate the difficulty/complexity of the medical query among below options:\n1) basic: a single medical agent can output an answer.\n2) intermediate: number of medical experts with different expertise should dicuss and make final decision.\n3) advanced: multiple teams of clinicians from different departments need to collaborate with each other to make final decision."""
     
-    medical_agent = Agent(instruction='You are a medical expert who conducts initial assessment and your job is to decide the difficulty/complexity of the medical query.', role='medical expert', model_info='gpt-3.5')
+    medical_agent = Agent(instruction='You are a medical expert who conducts initial assessment and your job is to decide the difficulty/complexity of the medical query.', role='medical expert', model_info=model)
     medical_agent.chat('You are a medical expert who conducts initial assessment and your job is to decide the difficulty/complexity of the medical query.')
     response = medical_agent.chat(difficulty_prompt)
 
@@ -253,6 +387,8 @@ def determine_difficulty(question, difficulty):
         return 'intermediate'
     elif 'advanced' in response.lower() or '3)' in response.lower():
         return 'advanced'
+    print(f"[warn] no usable complexity label; defaulting to basic. Got: {response[:80]!r}")
+    return 'basic'
 
 def process_basic_query(question, examplers, model, args):
     medical_agent = Agent(instruction='You are a helpful medical agent.', role='medical expert', model_info=model)
@@ -262,8 +398,9 @@ def process_basic_query(question, examplers, model, args):
         for ie, exampler in enumerate(examplers[:5]):
             tmp_exampler = {}
             exampler_question = exampler['question']
-            choices = [f"({k}) {v}" for k, v in exampler['options'].items()]
-            random.shuffle(choices)
+            choices = [f"({k}) {v}" for k, v in sorted(exampler['options'].items())]
+            if SHUFFLE_OPTIONS:
+                random.shuffle(choices)
             exampler_question += " " + ' '.join(choices)
             exampler_answer = f"Answer: ({exampler['answer_idx']}) {exampler['answer']}\n\n"
             exampler_reason = medical_agent.chat(f"You are a helpful medical agent. Below is an example of medical knowledge question and answer. After reviewing the below medical question and answering, can you provide 1-2 sentences of reason that support the answer as you didn't know the answer ahead?\n\nQuestion: {exampler_question}\n\nAnswer: {exampler_answer}")
@@ -283,14 +420,37 @@ def process_intermediate_query(question, examplers, model, args):
     cprint("[INFO] Step 1. Expert Recruitment", 'yellow', attrs=['blink'])
     recruit_prompt = f"""You are an experienced medical expert who recruits a group of experts with diverse identity and ask them to discuss and solve the given medical query."""
     
-    tmp_agent = Agent(instruction=recruit_prompt, role='recruiter', model_info='gpt-3.5')
+    tmp_agent = Agent(instruction=recruit_prompt, role='recruiter', model_info=model)
     tmp_agent.chat(recruit_prompt)
     
     num_agents = 5  # You can adjust this number as needed
     recruited = tmp_agent.chat(f"Question: {question}\nYou can recruit {num_agents} experts in different medical expertise. Considering the medical question and the options for the answer, what kind of experts will you recruit to better make an accurate answer?\nAlso, you need to specify the communication structure between experts (e.g., Pulmonologist == Neonatologist == Medical Geneticist == Pediatrician > Cardiologist), or indicate if they are independent.\n\nFor example, if you want to recruit five experts, you answer can be like:\n1. Pediatrician - Specializes in the medical care of infants, children, and adolescents. - Hierarchy: Independent\n2. Cardiologist - Focuses on the diagnosis and treatment of heart and blood vessel-related conditions. - Hierarchy: Pediatrician > Cardiologist\n3. Pulmonologist - Specializes in the diagnosis and treatment of respiratory system disorders. - Hierarchy: Independent\n4. Neonatologist - Focuses on the care of newborn infants, especially those who are born prematurely or have medical issues at birth. - Hierarchy: Independent\n5. Medical Geneticist - Specializes in the study of genes and heredity. - Hierarchy: Independent\n\nPlease answer in above format, and do not include your reason.")
 
-    agents_info = [agent_info.split(" - Hierarchy: ") for agent_info in recruited.split('\n') if agent_info]
-    agents_data = [(info[0], info[1]) if len(info) > 1 else (info[0], None) for info in agents_info]
+    parsed = parse_recruited(recruited, num_agents)
+
+    # Smaller models often ignore the requested format. Retry with a blunter
+    # instruction before giving up, and report it: a run that silently fell
+    # back to a default roster is not the same experiment.
+    attempts = 0
+    while len(parsed) < 2 and attempts < 2:
+        attempts += 1
+        cprint(f"[warn] recruiter output unparsable (attempt {attempts}); retrying", 'yellow')
+        recruited = tmp_agent.chat(
+            f"List exactly {num_agents} medical specialists for this question, "
+            f"one per line, in this format and nothing else:\n"
+            f"1. Role - one sentence description. - Hierarchy: Independent"
+        )
+        parsed = parse_recruited(recruited, num_agents)
+
+    if len(parsed) < 2:
+        cprint("[warn] recruiter still unparsable; using the default roster. "
+               "This deviates from the protocol and must be reported.", 'red')
+        parsed = list(DEFAULT_ROSTER)
+        TRACE['default_roster'] = True
+
+    # Rebuild the legacy shape so parse_hierarchy keeps working.
+    agents_data = [(f"{i+1}. {role} - {desc}", hier)
+                   for i, (role, desc, hier) in enumerate(parsed)]
 
     agent_emoji = ['\U0001F468\u200D\u2695\uFE0F', '\U0001F468\U0001F3FB\u200D\u2695\uFE0F', '\U0001F469\U0001F3FC\u200D\u2695\uFE0F', '\U0001F469\U0001F3FB\u200D\u2695\uFE0F', '\U0001f9d1\u200D\u2695\uFE0F', '\U0001f9d1\U0001f3ff\u200D\u2695\uFE0F', '\U0001f468\U0001f3ff\u200D\u2695\uFE0F', '\U0001f468\U0001f3fd\u200D\u2695\uFE0F', '\U0001f9d1\U0001f3fd\u200D\u2695\uFE0F', '\U0001F468\U0001F3FD\u200D\u2695\uFE0F']
     random.shuffle(agent_emoji)
@@ -298,20 +458,12 @@ def process_intermediate_query(question, examplers, model, args):
     hierarchy_agents = parse_hierarchy(agents_data, agent_emoji)
 
     agent_list = ""
-    for i, agent in enumerate(agents_data):
-        agent_role = agent[0].split('-')[0].split('.')[1].strip().lower()
-        description = agent[0].split('-')[1].strip().lower()
+    for i, (agent_role, description, _h) in enumerate(parsed):
         agent_list += f"Agent {i+1}: {agent_role} - {description}\n"
 
     agent_dict = {}
     medical_agents = []
-    for agent in agents_data:
-        try:
-            agent_role = agent[0].split('-')[0].split('.')[1].strip().lower()
-            description = agent[0].split('-')[1].strip().lower()
-        except:
-            continue
-        
+    for agent_role, description, _h in parsed:
         inst_prompt = f"""You are a {agent_role} who {description}. Your job is to collaborate with other medical experts in a team."""
         _agent = Agent(instruction=inst_prompt, role=agent_role, model_info=model)
         
@@ -319,11 +471,8 @@ def process_intermediate_query(question, examplers, model, args):
         agent_dict[agent_role] = _agent
         medical_agents.append(_agent)
 
-    for idx, agent in enumerate(agents_data):
-        try:
-            print(f"Agent {idx+1} ({agent_emoji[idx]} {agent[0].split('-')[0].strip()}): {agent[0].split('-')[1].strip()}")
-        except:
-            print(f"Agent {idx+1} ({agent_emoji[idx]}): {agent[0]}")
+    for idx, (agent_role, description, _h) in enumerate(parsed):
+        print(f"Agent {idx+1} ({agent_emoji[idx % len(agent_emoji)]} {agent_role}): {description}")
 
     fewshot_examplers = ""
     medical_agent = Agent(instruction='You are a helpful medical agent.', role='medical expert', model_info=model)
@@ -331,8 +480,9 @@ def process_intermediate_query(question, examplers, model, args):
         random.shuffle(examplers)
         for ie, exampler in enumerate(examplers[:5]):
             exampler_question = f"[Example {ie+1}]\n" + exampler['question']
-            options = [f"({k}) {v}" for k, v in exampler['options'].items()]
-            random.shuffle(options)
+            options = [f"({k}) {v}" for k, v in sorted(exampler['options'].items())]
+            if SHUFFLE_OPTIONS:
+                random.shuffle(options)
             exampler_question += " " + " ".join(options)
             exampler_answer = f"Answer: ({exampler['answer_idx']}) {exampler['answer']}"
             exampler_reason = tmp_agent.chat(f"Below is an example of medical knowledge question and answer. After reviewing the below medical question and answering, can you provide 1-2 sentences of reason that support the answer as you didn't know the answer ahead?\n\nQuestion: {exampler_question}\n\nAnswer: {exampler_answer}")
@@ -443,15 +593,22 @@ def process_intermediate_query(question, examplers, model, args):
     
     print(myTable)
 
+    # If no agent wanted to talk in round 1 the loop above exits before any
+    # agent has given a final answer, so `final_answer` is still None and the
+    # moderator below is asked to take a majority vote over "None".
+    TRACE['rounds_with_answers'] = sum(v is not None for v in round_answers.values())
+    TRACE['moderator_got_none'] = final_answer is None
+
     cprint("\n[INFO] Step 3. Final Decision", 'yellow', attrs=['blink'])
-    
+
     moderator = Agent("You are a final medical decision maker who reviews all opinions from different medical experts and make final decision.", "Moderator", model_info=model)
     moderator.chat('You are a final medical decision maker who reviews all opinions from different medical experts and make final decision.')
     
     _decision = moderator.temp_responses(f"Given each agent's final answer, please review each agent's opinion and make the final answer to the question by taking majority vote. Your answer should be like below format:\nAnswer: C) 2th pharyngeal arch\n{final_answer}\n\nQuestion: {question}", img_path=None)
     final_decision = {'majority': _decision}
 
-    print(f"{'\U0001F468\u200D\u2696\uFE0F'} moderator's final decision (by majority vote):", _decision)
+    _mod_emoji = '\U0001F468\u200D\u2696\uFE0F'
+    print(f"{_mod_emoji} moderator's final decision (by majority vote):", _decision)
     print()
 
     return final_decision
@@ -462,7 +619,7 @@ def process_advanced_query(question, model, args):
 
     recruit_prompt = f"""You are an experienced medical expert. Given the complex medical query, you need to organize Multidisciplinary Teams (MDTs) and the members in MDT to make accurate and robust answer."""
 
-    tmp_agent = Agent(instruction=recruit_prompt, role='recruiter', model_info='gpt-4o-mini')
+    tmp_agent = Agent(instruction=recruit_prompt, role='recruiter', model_info=model)
     tmp_agent.chat(recruit_prompt)
 
     num_teams = 3  # You can adjust this number as needed
@@ -480,8 +637,20 @@ def process_advanced_query(question, model, args):
             print(f" Member {i2+1} ({member['role']}): {member['expertise_description']}")
         print()
 
-        group_instance = Group(res_gs['group_goal'], res_gs['members'], question)
+        if not res_gs['members']:
+            cprint(f"  [warn] group {i1+1} had no parsable members; skipping", 'yellow')
+            continue
+        group_instance = Group(res_gs['group_goal'], res_gs['members'], question, model_info=model)
         group_instances.append(group_instance)
+
+    if not group_instances:
+        cprint("[warn] no MDT groups could be parsed; using a single default "
+               "team. This deviates from the protocol and must be reported.", 'red')
+        TRACE['default_roster'] = True
+        default_members = [{'role': r, 'expertise_description': d}
+                           for r, d, _ in DEFAULT_ROSTER]
+        group_instances = [Group('Initial Assessment Team (IAT)',
+                                 default_members, question, model_info=model)]
 
     # STEP 2. initial assessment from each group
     # STEP 2.1. IAP Process
