@@ -1,22 +1,23 @@
 """Run MDAgents on MedQA with MedGemma and save one record per question."""
-
+ 
 import argparse
 import json
 import os
 import random
 import re
 import time
-
+ 
+import openai
 from tqdm import tqdm
-
+ 
 import medgemma_backend as mg
 import utils
 from utils import (
     setup_model, load_data, create_question, determine_difficulty,
     process_basic_query, process_intermediate_query, process_advanced_query,
 )
-
-
+ 
+ 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--dataset', default='medqa')
@@ -37,8 +38,8 @@ def parse_args():
                    help="show answer options in order A,B,C,D instead of "
                         "upstream's shuffled display order")
     return p.parse_args()
-
-
+ 
+ 
 def answer(question, difficulty, examplers, args):
     """Send one question down the path the difficulty selects."""
     if difficulty == 'basic':
@@ -46,49 +47,59 @@ def answer(question, difficulty, examplers, args):
     if difficulty == 'intermediate':
         return process_intermediate_query(question, examplers, args.model, args)
     return process_advanced_query(question, args.model, args)
-
-
+ 
+ 
 def main():
     args = parse_args()
     random.seed(args.seed)
     utils.SHUFFLE_OPTIONS = not args.no_shuffle
-
+ 
     setup_model(args.model)
     test_qa, examplers = load_data(args.dataset, args.data_root)
-
+ 
     os.makedirs('output', exist_ok=True)
     suffix = '_noshuffle' if args.no_shuffle else ''
     out_path = args.output or (f'output/{args.model}_{args.dataset}_'
                                f'{args.difficulty}_seed{args.seed}{suffix}.json')
-
+ 
     results = []
     if args.resume and os.path.exists(out_path):
         results = json.load(open(out_path))
         print(f'[resume] {len(results)} already done in {out_path}')
     done = {r['index'] for r in results}
-
+ 
     start = time.time()
+    failures = 0
     out_of_time = False
     for index, sample in enumerate(tqdm(test_qa[:args.num_samples])):
         if index in done:
             continue
-        # Checked between questions, never during one, so a result is never
-        # written from a half-finished question.
+
         if args.time_budget and time.time() - start > args.time_budget:
             out_of_time = True
             print(f'\n[budget] stopping at question {index}; use --resume to continue')
             break
-
-        # Shuffling the options consumes random numbers, so seed per question:
-        # a resumed run then shows the same option order as an unbroken one.
+ 
         random.seed(args.seed * 100000 + index)
         utils.TRACE.clear()
-
+ 
         question, _ = create_question(sample, args.dataset)
         difficulty = determine_difficulty(question, args.difficulty, model=args.model)
-        decision = answer(question, difficulty, examplers, args)
-        letter, how = mg.pick_letter(decision, sample['options'])
-
+        try:
+            decision = answer(question, difficulty, examplers, args)
+            letter, how = mg.pick_letter(decision, sample['options'])
+            failures = 0
+        except openai.APIConnectionError:
+            raise
+        except Exception as error:
+            failures += 1
+            if failures >= 3:
+                raise
+            kind = ('context_overflow' if 'context length' in str(error)
+                    else f'error:{type(error).__name__}')
+            print(f'\n[error] question {index}: {kind}: {str(error)[:200]}')
+            decision, letter, how = '', None, kind
+ 
         results.append({
             'index': index,
             'question': question,
@@ -96,17 +107,17 @@ def main():
             'answer': sample['answer'],
             'options': sample['options'],
             'difficulty': difficulty,
-            'response': decision,            # the system's free-text decision
-            'picked_letter': letter,         # the option that decision selects
-            'picked_via': how,               # stated / model / unparsed / failed
-            'trace': dict(utils.TRACE),      # what happened inside the question
+            'response': decision,
+            'picked_letter': letter,
+            'picked_via': how,
+            'trace': dict(utils.TRACE),
             'truncated_calls': mg.TRUNCATED,
             'shuffled_options': not args.no_shuffle,
             'presented_order': re.findall(r'\(([A-E])\)',
                                           question.split('Options:')[-1]),
         })
-        json.dump(results, open(out_path, 'w'), indent=4)   # keep work after every question
-
+        json.dump(results, open(out_path, 'w'), indent=4)
+ 
     new = len(results) - len(done)
     print(f'\nWrote {len(results)} results to {out_path}')
     if new:
@@ -114,7 +125,7 @@ def main():
         print(f'{new} new in {seconds/60:.0f} min ({seconds/new:.1f} s/question)')
     if out_of_time:
         print(f'Stopped on the time budget: {len(results)}/{args.num_samples} done.')
-
-
+ 
+ 
 if __name__ == '__main__':
     main()

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=mdagents
-#SBATCH --account=CHANGE_ME              # your CSC project, e.g. project_2001234
+#SBATCH --account=project_2021639              # your CSC project, e.g. project_2001234
 #SBATCH --partition=gpumedium            # gputest = 15 min, for a first try
 #SBATCH --time=12:00:00                  # gpumedium allows up to 36:00:00
 #SBATCH --nodes=1
