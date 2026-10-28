@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import re
 from tqdm import tqdm
 from prettytable import PrettyTable 
 from termcolor import cprint
@@ -31,6 +32,8 @@ import medgemma_backend as mg
 SHUFFLE_OPTIONS = True
 
 TRACE = {}
+
+FIXED = False
 
 class Agent:
     def __init__(self, instruction, role, examplers=None, model_info='gpt-4o-mini', img_path=None):
@@ -198,7 +201,7 @@ def parse_hierarchy(info, emojis):
         
         if hierarchy is None:
             hierarchy = 'Independent'
-        
+
         if 'independent' not in hierarchy.lower() and '>' in hierarchy:
             parent = hierarchy.split(">")[0].strip()
             child = hierarchy.split(">")[1].strip()
@@ -368,6 +371,10 @@ def determine_difficulty(question, difficulty, model='gpt-3.5'):
     medical_agent = Agent(instruction='You are a medical expert who conducts initial assessment and your job is to decide the difficulty/complexity of the medical query.', role='medical expert', model_info=model)
     medical_agent.chat('You are a medical expert who conducts initial assessment and your job is to decide the difficulty/complexity of the medical query.')
     response = medical_agent.chat(difficulty_prompt)
+    TRACE['classifier_reply'] = response[:1000]
+
+    if FIXED:
+        return _fixed_difficulty(medical_agent, response)
 
     if 'basic' in response.lower() or '1)' in response.lower():
         return 'basic'
@@ -377,6 +384,34 @@ def determine_difficulty(question, difficulty, model='gpt-3.5'):
         return 'advanced'
     print(f"[warn] no usable complexity label; defaulting to basic. Got: {response[:80]!r}")
     return 'basic'
+
+_LABEL = re.compile(r'\b(basic|intermediate|advanced)\b')
+
+
+def _fixed_difficulty(medical_agent, response):
+    """Fix 1: route on the label the classifier chooses.
+
+    Upstream returns 'basic' if the word "basic" or "1)" appears anywhere in
+    the reply, so a reply that discusses the options is routed to the single
+    agent whatever it concludes. Here the same agent, with its reasoning still
+    in context, is asked to name its choice in one word. If that reply is
+    unclear, the last label in the original reply is used.
+    """
+    choice = medical_agent.chat("State your final choice. Reply with exactly one word: "
+                                "basic, intermediate, or advanced.")
+    TRACE['classifier_choice_reply'] = choice[:200]
+    named = set(_LABEL.findall(choice.lower()))
+    if len(named) == 1:
+        TRACE['classifier_parsed_from'] = 'choice'
+        return named.pop()
+    mentioned = _LABEL.findall(response.lower())
+    if mentioned:
+        TRACE['classifier_parsed_from'] = 'last_label'
+        return mentioned[-1]
+    TRACE['classifier_parsed_from'] = 'default'
+    print(f"[warn] no usable complexity label; defaulting to basic. Got: {choice[:80]!r}")
+    return 'basic'
+
 
 def process_basic_query(question, examplers, model, args):
     medical_agent = Agent(instruction='You are a helpful medical agent.', role='medical expert', model_info=model)
@@ -411,7 +446,7 @@ def process_intermediate_query(question, examplers, model, args):
     tmp_agent = Agent(instruction=recruit_prompt, role='recruiter', model_info=model)
     tmp_agent.chat(recruit_prompt)
     
-    num_agents = 5  # Can be adjusted as needed
+    num_agents = 5
     recruited = tmp_agent.chat(f"Question: {question}\nYou can recruit {num_agents} experts in different medical expertise. Considering the medical question and the options for the answer, what kind of experts will you recruit to better make an accurate answer?\nAlso, you need to specify the communication structure between experts (e.g., Pulmonologist == Neonatologist == Medical Geneticist == Pediatrician > Cardiologist), or indicate if they are independent.\n\nFor example, if you want to recruit five experts, you answer can be like:\n1. Pediatrician - Specializes in the medical care of infants, children, and adolescents. - Hierarchy: Independent\n2. Cardiologist - Focuses on the diagnosis and treatment of heart and blood vessel-related conditions. - Hierarchy: Pediatrician > Cardiologist\n3. Pulmonologist - Specializes in the diagnosis and treatment of respiratory system disorders. - Hierarchy: Independent\n4. Neonatologist - Focuses on the care of newborn infants, especially those who are born prematurely or have medical issues at birth. - Hierarchy: Independent\n5. Medical Geneticist - Specializes in the study of genes and heredity. - Hierarchy: Independent\n\nPlease answer in above format, and do not include your reason.")
 
     parsed = parse_recruited(recruited, num_agents)
@@ -432,6 +467,8 @@ def process_intermediate_query(question, examplers, model, args):
                "This deviates from the protocol and must be reported.", 'red')
         parsed = list(DEFAULT_ROSTER)
         TRACE['default_roster'] = True
+
+    TRACE['roster'] = [role for role, _, _ in parsed]
 
     agents_data = [(f"{i+1}. {role} - {desc}", hier)
                    for i, (role, desc, hier) in enumerate(parsed)]
@@ -516,6 +553,8 @@ def process_intermediate_query(question, examplers, model, args):
                 all_comments = "".join(f"{_k} -> Agent {idx+1}: {_v[f'Agent {idx+1}']}\n" for _k, _v in interaction_log[round_name][turn_name].items())
                 
                 participate = v.chat("Given the opinions from other medical experts in your team, please indicate whether you want to talk to any expert (yes/no)\n\nOpinions:\n{}".format(assessment if n == 1 else all_comments))
+                TRACE.setdefault('talk_replies', []).append(
+                    {'round': n, 'reply': participate[:300]})
                 
                 if 'yes' in participate.lower().strip():                
                     chosen_expert = v.chat(f"Enter the number of the expert you want to talk to:\n{agent_list}\nFor example, if you want to talk with Agent 1. Pediatrician, return just 1. If you want to talk with more than one expert, please return 1,2 and don't return the reasons.")
@@ -577,8 +616,15 @@ def process_intermediate_query(question, examplers, model, args):
     
     print(myTable)
 
+
     TRACE['rounds_with_answers'] = sum(v is not None for v in round_answers.values())
     TRACE['moderator_got_none'] = final_answer is None
+
+
+    if FIXED and final_answer is None:
+        final_answer = dict(round_opinions[1])
+        TRACE['moderator_got_none'] = False
+        TRACE['moderator_given_round1'] = True
 
     cprint("\n[INFO] Step 3. Final Decision", 'yellow', attrs=['blink'])
 
@@ -603,8 +649,8 @@ def process_advanced_query(question, model, args):
     tmp_agent = Agent(instruction=recruit_prompt, role='recruiter', model_info=model)
     tmp_agent.chat(recruit_prompt)
 
-    num_teams = 3  # Can be adjusted as needed
-    num_agents = 3  # Can be adjusted as needed
+    num_teams = 3
+    num_agents = 3
 
     recruited = tmp_agent.chat(f"Question: {question}\n\nYou should organize {num_teams} MDTs with different specialties or purposes and each MDT should have {num_agents} clinicians. Considering the medical question and the options, please return your recruitment plan to better make an accurate answer.\n\nFor example, the following can an example answer:\nGroup 1 - Initial Assessment Team (IAT)\nMember 1: Otolaryngologist (ENT Surgeon) (Lead) - Specializes in ear, nose, and throat surgery, including thyroidectomy. This member leads the group due to their critical role in the surgical intervention and managing any surgical complications, such as nerve damage.\nMember 2: General Surgeon - Provides additional surgical expertise and supports in the overall management of thyroid surgery complications.\nMember 3: Anesthesiologist - Focuses on perioperative care, pain management, and assessing any complications from anesthesia that may impact voice and airway function.\n\nGroup 2 - Diagnostic Evidence Team (DET)\nMember 1: Endocrinologist (Lead) - Oversees the long-term management of Graves' disease, including hormonal therapy and monitoring for any related complications post-surgery.\nMember 2: Speech-Language Pathologist - Specializes in voice and swallowing disorders, providing rehabilitation services to improve the patient's speech and voice quality following nerve damage.\nMember 3: Neurologist - Assesses and advises on nerve damage and potential recovery strategies, contributing neurological expertise to the patient's care.\n\nGroup 3 - Patient History Team (PHT)\nMember 1: Psychiatrist or Psychologist (Lead) - Addresses any psychological impacts of the chronic disease and its treatments, including issues related to voice changes, self-esteem, and coping strategies.\nMember 2: Physical Therapist - Offers exercises and strategies to maintain physical health and potentially support vocal function recovery indirectly through overall well-being.\nMember 3: Vocational Therapist - Assists the patient in adapting to changes in voice, especially if their profession relies heavily on vocal communication, helping them find strategies to maintain their occupational roles.\n\nGroup 4 - Final Review and Decision Team (FRDT)\nMember 1: Senior Consultant from each specialty (Lead) - Provides overarching expertise and guidance in decision\nMember 2: Clinical Decision Specialist - Coordinates the different recommendations from the various teams and formulates a comprehensive treatment plan.\nMember 3: Advanced Diagnostic Support - Utilizes advanced diagnostic tools and techniques to confirm the exact extent and cause of nerve damage, aiding in the final decision.\n\nAbove is just an example, thus, you should organize your own unique MDTs but you should include Initial Assessment Team (IAT) and Final Review and Decision Team (FRDT) in your recruitment plan. When you return your answer, please strictly refer to the above format.")
 
