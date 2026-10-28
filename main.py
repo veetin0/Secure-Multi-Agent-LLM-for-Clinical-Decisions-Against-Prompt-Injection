@@ -75,17 +75,20 @@ def main():
     done = {r['index'] for r in results}
 
     start = time.time()
-    failures = 0
+    failures = 0          # consecutive questions that raised an error
     out_of_time = False
     for index, sample in enumerate(tqdm(test_qa[:args.num_samples])):
         if index in done:
             continue
+        # Checked between questions, never during one, so a result is never
+        # written from a half-finished question.
         if args.time_budget and time.time() - start > args.time_budget:
             out_of_time = True
             print(f'\n[budget] stopping at question {index}; use --resume to continue')
             break
 
-
+        # Shuffling the options consumes random numbers, so seed per question:
+        # a resumed run then shows the same option order as an unbroken one.
         random.seed(args.seed * 100000 + index)
         utils.TRACE.clear()
 
@@ -96,9 +99,13 @@ def main():
             letter, how = mg.pick_letter(decision, sample['options'])
             failures = 0
         except openai.APIConnectionError:
-            raise 
+            raise                                   # server down: stop, don't record
         except Exception as error:
-
+            # The conversation outgrew the context window, or the model's reply
+            # broke a parser. Both are failures of the system on this question,
+            # so record them and count the question as unanswered instead of
+            # stopping a multi-hour run. Many in a row means something else is
+            # wrong, so stop then.
             failures += 1
             if failures >= 3:
                 raise
@@ -114,17 +121,17 @@ def main():
             'answer': sample['answer'],
             'options': sample['options'],
             'difficulty': difficulty,
-            'response': decision,            
-            'picked_letter': letter,         
-            'picked_via': how,              
-            'trace': dict(utils.TRACE),      
+            'response': decision,            # the system's free-text decision
+            'picked_letter': letter,         # the option that decision selects
+            'picked_via': how,               # stated / model / unparsed / failed
+            'trace': dict(utils.TRACE),      # what happened inside the question
             'truncated_calls': mg.TRUNCATED,
             'shuffled_options': not args.no_shuffle,
             'fixed': args.fixed,
             'presented_order': re.findall(r'\(([A-E])\)',
                                           question.split('Options:')[-1]),
         })
-        json.dump(results, open(out_path, 'w'), indent=4) 
+        json.dump(results, open(out_path, 'w'), indent=4)   # keep work after every question
 
     new = len(results) - len(done)
     print(f'\nWrote {len(results)} results to {out_path}')
