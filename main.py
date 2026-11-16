@@ -45,6 +45,10 @@ def parse_args():
                    default=os.environ.get('MDAGENTS_CLASSIFIER', 'code'),
                    help="complexity prompt: as in the released code, or as printed "
                         "in the MDAgents paper (also set by MDAGENTS_CLASSIFIER)")
+    p.add_argument('--defence', choices=['none', 'capability'],
+                   default=os.environ.get('MDAGENTS_DEFENCE', 'none'),
+                   help="protection layer (capabilities.py); acts only when passages "
+                        "are shown (also set by MDAGENTS_DEFENCE)")
     p.add_argument('--passages', default=os.environ.get('MDAGENTS_PASSAGES'),
                    help="jsonl of retrieved passages per question (from "
                         "prepare_passages.py); shown to the answering agents. "
@@ -96,11 +100,14 @@ def main():
     utils.SHUFFLE_OPTIONS = not args.no_shuffle
     utils.FIXED = args.fixed
     utils.CLASSIFIER = args.classifier
+    utils.DEFENCE = args.defence == 'capability'
+    if utils.DEFENCE and not args.passages:
+        print('[warn] --defence capability without --passages: nothing to protect, runs as undefended')
     if args.attack != 'none' and not args.passages:
         raise SystemExit('--attack needs --passages (the attack replaces one of them)')
     passages = load_jsonl(args.passages) if args.passages else None
     attacks = json.load(open(args.attack_file)) if args.attack != 'none' else None
-    print(f"[system] {'fixed' if args.fixed else 'published'} MDAgents, {args.classifier} classifier")
+    print(f"[system] {'fixed' if args.fixed else 'published'} MDAgents, {args.classifier} classifier, defence {args.defence}")
 
     setup_model(args.model)
     test_qa, examplers = load_data(args.dataset, args.data_root)
@@ -108,6 +115,7 @@ def main():
     os.makedirs('output', exist_ok=True)
     suffix = (('_noshuffle' if args.no_shuffle else '') + ('_fixed' if args.fixed else '')
               + ('_paperclf' if args.classifier == 'paper' else '')
+              + ('_capability' if args.defence == 'capability' else '')
               + ('_rag' if args.passages else '')
               + (f'_{args.attack}' if args.attack != 'none' else ''))
     out_path = args.output or (f'output/{args.model}_{args.dataset}_'
@@ -136,6 +144,7 @@ def main():
         # a resumed run then shows the same option order as an unbroken one.
         random.seed(args.seed * 100000 + index)
         utils.TRACE.clear()
+        utils.OPTIONS = sample['options']
         target = None
         if passages is not None:
             utils.PASSAGES, attack = passages_for(index, args, passages, attacks)
@@ -183,6 +192,8 @@ def main():
             'shuffled_options': not args.no_shuffle,
             'fixed': args.fixed,
             'classifier': args.classifier,
+            'defence': args.defence,
+            'flagged': utils.TRACE.get('defence', {}).get('flagged'),
             'passages': bool(args.passages),
             'attack': args.attack,
             'target': target,                # option the attacker wants chosen

@@ -2,6 +2,9 @@ import os
 import json
 import random
 import re
+from collections import Counter
+
+import capabilities as cap
 from tqdm import tqdm
 from prettytable import PrettyTable 
 from termcolor import cprint
@@ -101,6 +104,37 @@ def paper_difficulty(medical_agent, response):
 # exactly as published.
 PASSAGES = None   # list of {'title', 'text'} shown to the answering agents
 MARKER = None     # string whose spread the propagation attack is measured by
+
+
+# --defence capability: the protection layer (capabilities.py). main.py sets
+# OPTIONS per question so that choices can be extracted as option letters.
+DEFENCE = False
+OPTIONS = None
+
+
+def extract_choice(text, *context):
+    """Quarantined extraction: free text -> an option letter with provenance.
+
+    The extraction call's output is restricted to the option letters, so
+    nothing the text says beyond its choice can pass through it.
+    """
+    letter, how = mg.pick_letter(text, OPTIONS)
+    TRACE.setdefault('extractions', Counter())[how] += 1
+    source = cap.output_of(text, *context)
+    return cap.choice(letter if letter in (OPTIONS or {}) else None, source)
+
+
+def choice_text(c):
+    """How a structured choice is shown to another agent."""
+    return f"Answer: ({c.data}) {OPTIONS[c.data]}" if c.data else "Answer: (no choice)"
+
+
+def defended_answer(decision):
+    """Record the policy's decision and return it as the system's text."""
+    TRACE['defence'] = {k: decision[k] for k in ('answer', 'flagged', 'tainted', 'trusted')}
+    if decision['answer'] is None:
+        return {0.0: "Answer: (no choice)"}
+    return {0.0: f"Answer: ({decision['answer']}) {OPTIONS[decision['answer']]}"}
 
 
 def reference_block():
@@ -532,7 +566,17 @@ def process_basic_query(question, examplers, model, args):
     single_agent = Agent(instruction='You are a helpful assistant that answers multiple choice questions about medical knowledge.', role='medical expert', examplers=new_examplers, model_info=model)
     single_agent.chat('You are a helpful assistant that answers multiple choice questions about medical knowledge.')
     final_decision = single_agent.temp_responses(f'''The following are multiple choice questions (with answers) about medical knowledge. Let's think step by step.\n\n**Question:** {question}{reference_block()}\nAnswer: ''', img_path=None)
-    
+
+    if DEFENCE and PASSAGES:
+        q, p = cap.question(question), cap.passages(PASSAGES)
+        tainted = extract_choice(final_decision[0.0], q, p)
+        # The same agent, with the same examples, on the question alone.
+        clean_agent = Agent(instruction='You are a helpful assistant that answers multiple choice questions about medical knowledge.', role='medical expert', examplers=new_examplers, model_info=model)
+        clean_agent.chat('You are a helpful assistant that answers multiple choice questions about medical knowledge.')
+        clean = clean_agent.temp_responses(f'''The following are multiple choice questions (with answers) about medical knowledge. Let's think step by step.\n\n**Question:** {question}\nAnswer: ''', img_path=None)
+        trusted = extract_choice(clean[0.0], q)
+        return defended_answer(cap.decide([tainted], [trusted]))
+
     return final_decision
 
 def process_intermediate_query(question, examplers, model, args):
@@ -628,9 +672,18 @@ def process_intermediate_query(question, examplers, model, args):
     round_opinions = {n: {} for n in range(1, num_rounds+1)}
     round_answers = {n: None for n in range(1, num_rounds+1)}
     initial_report = ""
+    defended = DEFENCE and bool(PASSAGES)
+    if defended:
+        q_val, p_val = cap.question(question), cap.passages(PASSAGES)
+        current = {}          # each expert's latest structured choice
     for k, v in agent_dict.items():
         opinion = v.chat(f'''Given the examplers, please return your answer to the medical query among the option provided.\n\n{fewshot_examplers}\n\nQuestion: {question}{reference_block()}\n\nYour answer should be like below format.\n\nAnswer: ''', img_path=None)
         note_marker('opinion', opinion)
+        if defended:
+            # P3: the other agents, the summariser and the moderator see only
+            # the expert's choice, never its text.
+            current[k] = extract_choice(opinion, q_val, p_val)
+            opinion = cap.to_context(cap.Value(choice_text(current[k]), current[k].sources, structured=True))
         initial_report += f"({k.lower()}): {opinion}\n"
         round_opinions[1][k.lower()] = opinion
 
@@ -665,6 +718,13 @@ def process_intermediate_query(question, examplers, model, args):
 
                     for ce in chosen_experts:
                         specific_question = v.chat(f"Please remind your medical expertise and then leave your opinion to an expert you chose (Agent {ce}. {medical_agents[ce-1].role}). You should deliver your opinion once you are confident enough and in a way to convince other expert with a short reason.")
+                        if defended:
+                            # Only the choice the message argues for is delivered.
+                            said = extract_choice(specific_question, q_val, p_val)
+                            if said.data is None:
+                                said = current[v.role]
+                            current[v.role] = said
+                            specific_question = cap.to_context(cap.Value(choice_text(said), said.sources, structured=True))
                         
                         print(f" Agent {idx+1} ({agent_emoji[idx]} {medical_agents[idx].role}) -> Agent {ce} ({agent_emoji[ce-1]} {medical_agents[ce-1].role}) : {specific_question}")
                         interaction_log[round_name][turn_name][f'Agent {idx+1}'][f'Agent {ce}'] = specific_question
@@ -683,8 +743,11 @@ def process_intermediate_query(question, examplers, model, args):
         tmp_final_answer = {}
         for i, agent in enumerate(medical_agents):
             response = agent.chat(f"Now that you've interacted with other medical experts, remind your expertise and the comments from other experts and make your final answer to the given question:\n{question}\nAnswer: ")
-            tmp_final_answer[agent.role] = response
             note_marker('final', response)
+            if defended:
+                current[agent.role] = extract_choice(response, q_val, p_val)
+                response = current[agent.role]
+            tmp_final_answer[agent.role] = response
 
         round_answers[round_name] = tmp_final_answer
         final_answer = tmp_final_answer
@@ -734,6 +797,27 @@ def process_intermediate_query(question, examplers, model, args):
         TRACE['moderator_given_round1'] = True
 
     cprint("\n[INFO] Step 3. Final Decision", 'yellow', attrs=['blink'])
+
+    if defended:
+        # Tainted choices: the final answers if a round produced them, else
+        # the opening choices (the same repair as --fixed, on structured values).
+        tainted = list(final_answer.values()) if isinstance(final_answer, dict) and final_answer \
+            and all(isinstance(c, cap.Value) for c in final_answer.values()) else list(current.values())
+        # Trusted choices: the same experts, fresh, on the question alone.
+        trusted = []
+        for agent_role, description, _h in parsed:
+            inst_prompt = f"""You are a {agent_role} who {description}. Your job is to collaborate with other medical experts in a team."""
+            clean = Agent(instruction=inst_prompt, role=agent_role, model_info=model)
+            clean.chat(inst_prompt)
+            clean_opinion = clean.chat(f'''Given the examplers, please return your answer to the medical query among the option provided.\n\n{fewshot_examplers}\n\nQuestion: {question}\n\nYour answer should be like below format.\n\nAnswer: ''', img_path=None)
+            trusted.append(extract_choice(clean_opinion, q_val))
+        decision = cap.decide(tainted, trusted)
+        TRACE['choices'] = {'tainted': [c.data for c in tainted], 'trusted': [c.data for c in trusted]}
+        _decision = defended_answer(decision)
+        note_marker('moderator', _decision)
+        print(f"[defence] tainted {decision['tainted']} trusted {decision['trusted']} -> {decision['answer']}"
+              f"{' (flagged)' if decision['flagged'] else ''}")
+        return {'majority': _decision}
 
     moderator = Agent("You are a final medical decision maker who reviews all opinions from different medical experts and make final decision.", "Moderator", model_info=model)
     moderator.chat('You are a final medical decision maker who reviews all opinions from different medical experts and make final decision.')
