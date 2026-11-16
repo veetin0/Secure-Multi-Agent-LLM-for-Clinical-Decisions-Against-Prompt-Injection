@@ -18,6 +18,10 @@ from openai import OpenAI
 from answer import stated_letter, text_of
 
 TRUNCATED = 0     # completions cut off at the token cap, counted over the run
+# Cost counters over the run (main.py stores the change per question).
+CALLS = 0
+PROMPT_TOKENS = 0
+COMPLETION_TOKENS = 0
 _client = None
 _guided_works = True
 
@@ -45,6 +49,15 @@ def get_client():
     return _client
 
 
+def _count(response):
+    global CALLS, PROMPT_TOKENS, COMPLETION_TOKENS
+    CALLS += 1
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        PROMPT_TOKENS += usage.prompt_tokens or 0
+        COMPLETION_TOKENS += usage.completion_tokens or 0
+
+
 def chat_completion(messages):
     """One model call. Counts completions that were cut off at the token cap."""
     global TRUNCATED
@@ -53,6 +66,7 @@ def chat_completion(messages):
         model=model_name(), messages=messages,
         temperature=0.0, max_tokens=max_tokens,
     )
+    _count(response)
     choice = response.choices[0]
     if choice.finish_reason == "length":
         TRUNCATED += 1
@@ -83,10 +97,12 @@ def pick_letter(decision, options):
         f"Reply with one letter ({', '.join(letters)}) and nothing else."
     )
     def ask(extra):
-        return get_client().chat.completions.create(
+        response = get_client().chat.completions.create(
             model=model_name(), temperature=0.0, max_tokens=8,
             messages=[{"role": "user", "content": prompt}], **extra,
-        ).choices[0].message.content or ""
+        )
+        _count(response)
+        return response.choices[0].message.content or ""
 
     global _guided_works
     try:
