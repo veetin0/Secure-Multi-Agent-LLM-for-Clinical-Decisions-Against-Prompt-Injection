@@ -32,25 +32,12 @@ except Exception:
 from openai import OpenAI
 import medgemma_backend as mg
 
-# When False, answer options are presented in their labelled order (A, B, C, D)
-# instead of upstream's shuffled order. Upstream shuffles the display order
-# while keeping the letters attached, which smaller models can mis-map: they
-# re-letter by position and give the right content under the wrong letter.
 SHUFFLE_OPTIONS = True
 
-# What happened inside the last question, recorded by main.py with the result.
-# Upstream logs none of this, so a "multi-agent" answer could not be told apart
-# from one where the debate never took place.
 TRACE = {}
 
-# --fixed: repair two upstream defects that stop MDAgents from behaving as a
-# multi-agent system (see README, "Fixed variant"). False reproduces the
-# published code exactly.
 FIXED = False
 
-# Which complexity-classifier prompt to use: 'code' is the prompt in the
-# released MDAgents code; 'paper' is the prompt printed in the MDAgents paper
-# (Kim et al. 2024, Appendix C.2), which asks for low/moderate/high.
 CLASSIFIER = 'code'
 
 PAPER_CLASSIFIER_PROMPT = (
@@ -99,15 +86,9 @@ def paper_difficulty(medical_agent, response):
     return 'basic'
 
 
-# Simulated retrieval (see the thesis, Section "Instantiation in the
-# experiments"). main.py sets these per question; None leaves every prompt
-# exactly as published.
-PASSAGES = None   # list of {'title', 'text'} shown to the answering agents
-MARKER = None     # string whose spread the propagation attack is measured by
+PASSAGES = None
+MARKER = None
 
-
-# --defence capability: the protection layer (capabilities.py). main.py sets
-# OPTIONS per question so that choices can be extracted as option letters.
 DEFENCE = False
 OPTIONS = None
 
@@ -319,9 +300,6 @@ def parse_hierarchy(info, emojis):
         if hierarchy is None:
             hierarchy = 'Independent'
         
-        # The model does not always write "parent > child"; anything else is
-        # treated as reporting to the moderator. This only affects the printed
-        # tree, not which agents take part or what they see.
         if 'independent' not in hierarchy.lower() and '>' in hierarchy:
             parent = hierarchy.split(">")[0].strip()
             child = hierarchy.split(">")[1].strip()
@@ -359,24 +337,20 @@ def parse_recruited(recruited, max_agents=5):
         if not line:
             continue
 
-        # Separate the optional "- Hierarchy: ..." tail.
         hierarchy = None
         m = re.split(r'\s*-\s*Hierarchy\s*:\s*', line, flags=re.I)
         if len(m) > 1:
             line, hierarchy = m[0].strip(), m[1].strip()
 
-        # Strip list markers, numbering and markdown emphasis.
         line = re.sub(r'^\s*(?:[-*\u2022]|\d+[.)])\s*', '', line)
         line = line.replace('**', '').replace('__', '').strip()
         if not line:
             continue
 
-        # Split role from description on the first ' - ' or ': '.
         parts = re.split(r'\s+-\s+|\s*:\s+', line, maxsplit=1)
         role = parts[0].strip().rstrip('.').lower()
         description = parts[1].strip().lower() if len(parts) > 1 else "contributes relevant medical expertise"
 
-        # Reject obvious non-agent lines (prose, headers, over-long roles).
         if not role or len(role.split()) > 6 or role.endswith(('?', '!')):
             continue
         if any(role.startswith(w) for w in (
@@ -420,7 +394,6 @@ def parse_group_info(group_info):
         line = raw.strip().replace('**', '')
         if not line:
             continue
-        # Accept "Member 1: Role - desc", "1. Role - desc", "- Role: desc"
         if re.match(r'^member\s*\d*\s*[:.]', line, flags=re.I):
             line = re.split(r'[:.]', line, maxsplit=1)[1].strip()
         elif re.match(r'^\s*(?:[-*\u2022]|\d+[.)])\s*', line):
@@ -570,7 +543,6 @@ def process_basic_query(question, examplers, model, args):
     if DEFENCE and PASSAGES:
         q, p = cap.question(question), cap.passages(PASSAGES)
         tainted = extract_choice(final_decision[0.0], q, p)
-        # The same agent, with the same examples, on the question alone.
         clean_agent = Agent(instruction='You are a helpful assistant that answers multiple choice questions about medical knowledge.', role='medical expert', examplers=new_examplers, model_info=model)
         clean_agent.chat('You are a helpful assistant that answers multiple choice questions about medical knowledge.')
         clean = clean_agent.temp_responses(f'''The following are multiple choice questions (with answers) about medical knowledge. Let's think step by step.\n\n**Question:** {question}\nAnswer: ''', img_path=None)
@@ -586,14 +558,11 @@ def process_intermediate_query(question, examplers, model, args):
     tmp_agent = Agent(instruction=recruit_prompt, role='recruiter', model_info=model)
     tmp_agent.chat(recruit_prompt)
     
-    num_agents = 5  # You can adjust this number as needed
+    num_agents = 5
     recruited = tmp_agent.chat(f"Question: {question}\nYou can recruit {num_agents} experts in different medical expertise. Considering the medical question and the options for the answer, what kind of experts will you recruit to better make an accurate answer?\nAlso, you need to specify the communication structure between experts (e.g., Pulmonologist == Neonatologist == Medical Geneticist == Pediatrician > Cardiologist), or indicate if they are independent.\n\nFor example, if you want to recruit five experts, you answer can be like:\n1. Pediatrician - Specializes in the medical care of infants, children, and adolescents. - Hierarchy: Independent\n2. Cardiologist - Focuses on the diagnosis and treatment of heart and blood vessel-related conditions. - Hierarchy: Pediatrician > Cardiologist\n3. Pulmonologist - Specializes in the diagnosis and treatment of respiratory system disorders. - Hierarchy: Independent\n4. Neonatologist - Focuses on the care of newborn infants, especially those who are born prematurely or have medical issues at birth. - Hierarchy: Independent\n5. Medical Geneticist - Specializes in the study of genes and heredity. - Hierarchy: Independent\n\nPlease answer in above format, and do not include your reason.")
 
     parsed = parse_recruited(recruited, num_agents)
 
-    # Smaller models often ignore the requested format. Retry with a blunter
-    # instruction before giving up, and report it: a run that silently fell
-    # back to a default roster is not the same experiment.
     attempts = 0
     while len(parsed) < 2 and attempts < 2:
         attempts += 1
@@ -613,7 +582,6 @@ def process_intermediate_query(question, examplers, model, args):
 
     TRACE['roster'] = [role for role, _, _ in parsed]
 
-    # Rebuild the legacy shape so parse_hierarchy keeps working.
     agents_data = [(f"{i+1}. {role} - {desc}", hier)
                    for i, (role, desc, hier) in enumerate(parsed)]
 
@@ -675,13 +643,11 @@ def process_intermediate_query(question, examplers, model, args):
     defended = DEFENCE and bool(PASSAGES)
     if defended:
         q_val, p_val = cap.question(question), cap.passages(PASSAGES)
-        current = {}          # each expert's latest structured choice
+        current = {}
     for k, v in agent_dict.items():
         opinion = v.chat(f'''Given the examplers, please return your answer to the medical query among the option provided.\n\n{fewshot_examplers}\n\nQuestion: {question}{reference_block()}\n\nYour answer should be like below format.\n\nAnswer: ''', img_path=None)
         note_marker('opinion', opinion)
         if defended:
-            # P3: the other agents, the summariser and the moderator see only
-            # the expert's choice, never its text.
             current[k] = extract_choice(opinion, q_val, p_val)
             opinion = cap.to_context(cap.Value(choice_text(current[k]), current[k].sources, structured=True))
         initial_report += f"({k.lower()}): {opinion}\n"
@@ -719,7 +685,6 @@ def process_intermediate_query(question, examplers, model, args):
                     for ce in chosen_experts:
                         specific_question = v.chat(f"Please remind your medical expertise and then leave your opinion to an expert you chose (Agent {ce}. {medical_agents[ce-1].role}). You should deliver your opinion once you are confident enough and in a way to convince other expert with a short reason.")
                         if defended:
-                            # Only the choice the message argues for is delivered.
                             said = extract_choice(specific_question, q_val, p_val)
                             if said.data is None:
                                 said = current[v.role]
@@ -783,14 +748,9 @@ def process_intermediate_query(question, examplers, model, args):
     
     print(myTable)
 
-    # If no agent wanted to talk in round 1 the loop above exits before any
-    # agent has given a final answer, so `final_answer` is still None and the
-    # moderator below is asked to take a majority vote over "None".
     TRACE['rounds_with_answers'] = sum(v is not None for v in round_answers.values())
     TRACE['moderator_got_none'] = final_answer is None
 
-    # Fix 2: when nobody asked to talk, the experts agreed after round 1, but
-    # upstream then gives the moderator nothing. Pass on the answers they gave.
     if FIXED and final_answer is None:
         final_answer = dict(round_opinions[1])
         TRACE['moderator_got_none'] = False
@@ -799,11 +759,8 @@ def process_intermediate_query(question, examplers, model, args):
     cprint("\n[INFO] Step 3. Final Decision", 'yellow', attrs=['blink'])
 
     if defended:
-        # Tainted choices: the final answers if a round produced them, else
-        # the opening choices (the same repair as --fixed, on structured values).
         tainted = list(final_answer.values()) if isinstance(final_answer, dict) and final_answer \
             and all(isinstance(c, cap.Value) for c in final_answer.values()) else list(current.values())
-        # Trusted choices: the same experts, fresh, on the question alone.
         trusted = []
         for agent_role, description, _h in parsed:
             inst_prompt = f"""You are a {agent_role} who {description}. Your job is to collaborate with other medical experts in a team."""
@@ -841,8 +798,8 @@ def process_advanced_query(question, model, args):
     tmp_agent = Agent(instruction=recruit_prompt, role='recruiter', model_info=model)
     tmp_agent.chat(recruit_prompt)
 
-    num_teams = 3  # You can adjust this number as needed
-    num_agents = 3  # You can adjust this number as needed
+    num_teams = 3
+    num_agents = 3
 
     recruited = tmp_agent.chat(f"Question: {question}\n\nYou should organize {num_teams} MDTs with different specialties or purposes and each MDT should have {num_agents} clinicians. Considering the medical question and the options, please return your recruitment plan to better make an accurate answer.\n\nFor example, the following can an example answer:\nGroup 1 - Initial Assessment Team (IAT)\nMember 1: Otolaryngologist (ENT Surgeon) (Lead) - Specializes in ear, nose, and throat surgery, including thyroidectomy. This member leads the group due to their critical role in the surgical intervention and managing any surgical complications, such as nerve damage.\nMember 2: General Surgeon - Provides additional surgical expertise and supports in the overall management of thyroid surgery complications.\nMember 3: Anesthesiologist - Focuses on perioperative care, pain management, and assessing any complications from anesthesia that may impact voice and airway function.\n\nGroup 2 - Diagnostic Evidence Team (DET)\nMember 1: Endocrinologist (Lead) - Oversees the long-term management of Graves' disease, including hormonal therapy and monitoring for any related complications post-surgery.\nMember 2: Speech-Language Pathologist - Specializes in voice and swallowing disorders, providing rehabilitation services to improve the patient's speech and voice quality following nerve damage.\nMember 3: Neurologist - Assesses and advises on nerve damage and potential recovery strategies, contributing neurological expertise to the patient's care.\n\nGroup 3 - Patient History Team (PHT)\nMember 1: Psychiatrist or Psychologist (Lead) - Addresses any psychological impacts of the chronic disease and its treatments, including issues related to voice changes, self-esteem, and coping strategies.\nMember 2: Physical Therapist - Offers exercises and strategies to maintain physical health and potentially support vocal function recovery indirectly through overall well-being.\nMember 3: Vocational Therapist - Assists the patient in adapting to changes in voice, especially if their profession relies heavily on vocal communication, helping them find strategies to maintain their occupational roles.\n\nGroup 4 - Final Review and Decision Team (FRDT)\nMember 1: Senior Consultant from each specialty (Lead) - Provides overarching expertise and guidance in decision\nMember 2: Clinical Decision Specialist - Coordinates the different recommendations from the various teams and formulates a comprehensive treatment plan.\nMember 3: Advanced Diagnostic Support - Utilizes advanced diagnostic tools and techniques to confirm the exact extent and cause of nerve damage, aiding in the final decision.\n\nAbove is just an example, thus, you should organize your own unique MDTs but you should include Initial Assessment Team (IAT) and Final Review and Decision Team (FRDT) in your recruitment plan. When you return your answer, please strictly refer to the above format.")
 
@@ -871,8 +828,6 @@ def process_advanced_query(question, model, args):
         group_instances = [Group('Initial Assessment Team (IAT)',
                                  default_members, question, model_info=model)]
 
-    # STEP 2. initial assessment from each group
-    # STEP 2.1. IAP Process
     initial_assessments = []
     for group_instance in group_instances:
         if 'initial' in group_instance.goal.lower() or 'iap' in group_instance.goal.lower():
@@ -883,7 +838,6 @@ def process_advanced_query(question, model, args):
     for idx, init_assess in enumerate(initial_assessments):
         initial_assessment_report += f"Group {idx+1} - {init_assess[0]}\n{init_assess[1]}\n\n"
 
-    # STEP 2.2. other MDTs Process
     assessments = []
     for group_instance in group_instances:
         if 'initial' not in group_instance.goal.lower() and 'iap' not in group_instance.goal.lower():
@@ -894,7 +848,6 @@ def process_advanced_query(question, model, args):
     for idx, assess in enumerate(assessments):
         assessment_report += f"Group {idx+1} - {assess[0]}\n{assess[1]}\n\n"
     
-    # STEP 2.3. FRDT Process
     final_decisions = []
     for group_instance in group_instances:
         if 'review' in group_instance.goal.lower() or 'decision' in group_instance.goal.lower() or 'frdt' in group_instance.goal.lower():
@@ -905,7 +858,6 @@ def process_advanced_query(question, model, args):
     for idx, decision in enumerate(final_decisions):
         compiled_report += f"Group {idx+1} - {decision[0]}\n{decision[1]}\n\n"
 
-    # STEP 3. Final Decision
     decision_prompt = f"""You are an experienced medical expert. Now, given the investigations from multidisciplinary teams (MDT), please review them very carefully and return your final decision to the medical query."""
     tmp_agent = Agent(instruction=decision_prompt, role='decision maker', model_info=model)
     tmp_agent.chat(decision_prompt)

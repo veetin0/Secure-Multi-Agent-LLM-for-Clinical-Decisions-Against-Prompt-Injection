@@ -1,14 +1,4 @@
 #!/bin/bash
-# One-time setup for running MedGemma 27B on Roihu's CPU nodes with llama.cpp.
-# Run as a batch job from roihu-cpu.csc.fi (it downloads ~55 GB and converts it):
-#
-#   sbatch --account=<project> scripts/setup_cpu.sh
-#
-# Puts everything under /scratch/<project>/$USER:
-#   llama.cpp/            llama.cpp, built for all x86 CPU variants
-#   venv/                 Python with openai, tqdm and the conversion tools
-#   medgemma-27b-hf/      the original weights (needs ~/.hf_token)
-#   medgemma-27b-q8_0.gguf  8-bit model used by scripts/roihu_cpu.sh
 #SBATCH --job-name=setup-cpu
 #SBATCH --partition=small
 #SBATCH --cpus-per-task=32
@@ -25,7 +15,6 @@ module load gcc cmake 2>/dev/null || module load cmake 2>/dev/null || true
 if [ ! -d llama.cpp ]; then
   git clone --depth 1 https://github.com/ggml-org/llama.cpp
 fi
-# All CPU variants with runtime selection, so the build runs on any node type.
 cmake -S llama.cpp -B llama.cpp/build -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
       -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build llama.cpp/build -j "${SLURM_CPUS_PER_TASK:-16}" --target llama-server

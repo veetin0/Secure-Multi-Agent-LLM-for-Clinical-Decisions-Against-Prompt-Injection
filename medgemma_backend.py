@@ -17,8 +17,7 @@ from openai import OpenAI
 
 from answer import stated_letter, text_of
 
-TRUNCATED = 0     # completions cut off at the token cap, counted over the run
-# Cost counters over the run (main.py stores the change per question).
+TRUNCATED = 0 
 CALLS = 0
 PROMPT_TOKENS = 0
 COMPLETION_TOKENS = 0
@@ -108,10 +107,8 @@ def pick_letter(decision, options):
     try:
         if os.environ.get("MEDGEMMA_GUIDED") == "1" and _guided_works:
             try:
-                reply = ask({"extra_body": {"guided_choice": letters}})   # vLLM only
+                reply = ask({"extra_body": {"guided_choice": letters}})
             except Exception:
-                # Newer vLLM versions renamed this option. Fall back to a
-                # plain call rather than leaving the question unscored.
                 _guided_works = False
                 print("[warn] server rejected guided_choice; asking without it")
                 reply = ask({})

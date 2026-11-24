@@ -39,7 +39,7 @@ class PolicyViolation(Exception):
 class Value:
     data: object
     sources: frozenset
-    structured: bool = False      # an option letter, not free text
+    structured: bool = False 
 
     @property
     def trusted(self):
@@ -96,7 +96,7 @@ def decide(tainted, trusted):
         if not c.structured:
             raise PolicyViolation("the decision may only use structured choices")
     t, s = majority(tainted), majority(trusted)
-    if s is None:                       # no trusted choice: nothing to check against
+    if s is None:
         return {"answer": t, "flagged": t is not None, "tainted": t, "trusted": s}
     if t is None or t == s:
         return {"answer": s, "flagged": t is None, "tainted": t, "trusted": s}

@@ -73,8 +73,6 @@ def main():
                for q in test]
     vocab = set().union(*queries)
 
-    # One pass over the corpus, keeping postings only for words that occur in
-    # some query: memory stays small although the corpus has ~125k chunks.
     files = corpus_files(args.cache)
     postings = {w: [] for w in vocab}
     lengths, meta = [], []

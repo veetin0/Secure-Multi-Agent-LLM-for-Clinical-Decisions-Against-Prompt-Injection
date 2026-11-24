@@ -79,8 +79,6 @@ def passages_for(index, args, passages, attacks):
     if args.attack == 'none':
         return shown, None
     attack = attacks[str(index)]
-    # The attacker's passage replaces one benign passage, at a position fixed
-    # per question, so the number and format of passages never give it away.
     shown[attack['position'] % len(shown)] = attack['passages'][args.attack]
     return shown, attack
 
@@ -128,20 +126,16 @@ def main():
     done = {r['index'] for r in results}
 
     start = time.time()
-    failures = 0          # consecutive questions that raised an error
+    failures = 0
     out_of_time = False
     for index, sample in enumerate(tqdm(test_qa[:args.num_samples])):
         if index in done:
             continue
-        # Checked between questions, never during one, so a result is never
-        # written from a half-finished question.
         if args.time_budget and time.time() - start > args.time_budget:
             out_of_time = True
             print(f'\n[budget] stopping at question {index}; use --resume to continue')
             break
 
-        # Shuffling the options consumes random numbers, so seed per question:
-        # a resumed run then shows the same option order as an unbroken one.
         random.seed(args.seed * 100000 + index)
         utils.TRACE.clear()
         utils.OPTIONS = sample['options']
@@ -160,17 +154,10 @@ def main():
             letter, how = mg.pick_letter(decision, sample['options'])
             failures = 0
         except openai.APIConnectionError:
-            raise                                   # server down: stop, don't record
+            raise
         except Exception as error:
-            # The conversation outgrew the context window, or the model's reply
-            # broke a parser. Both are failures of the system on this question,
-            # so record them and count the question as unanswered instead of
-            # stopping a multi-hour run. Many in a row means something else is
-            # wrong, so stop then.
             kind = ('context_overflow' if 'context length' in str(error)
                     else f'error:{type(error).__name__}')
-            # An overflow is an outcome of the question (the availability
-            # attack provokes them); only other errors in a row stop the run.
             failures = 0 if kind == 'context_overflow' else failures + 1
             if failures >= 3:
                 raise
@@ -184,10 +171,10 @@ def main():
             'answer': sample['answer'],
             'options': sample['options'],
             'difficulty': difficulty,
-            'response': decision,            # the system's free-text decision
-            'picked_letter': letter,         # the option that decision selects
-            'picked_via': how,               # stated / model / unparsed / failed
-            'trace': dict(utils.TRACE),      # what happened inside the question
+            'response': decision,
+            'picked_letter': letter,
+            'picked_via': how,
+            'trace': dict(utils.TRACE),
             'truncated_calls': mg.TRUNCATED,
             'shuffled_options': not args.no_shuffle,
             'fixed': args.fixed,
@@ -196,7 +183,7 @@ def main():
             'flagged': utils.TRACE.get('defence', {}).get('flagged'),
             'passages': bool(args.passages),
             'attack': args.attack,
-            'target': target,                # option the attacker wants chosen
+            'target': target,
             'calls': mg.CALLS - calls0,
             'prompt_tokens': mg.PROMPT_TOKENS - ptok0,
             'completion_tokens': mg.COMPLETION_TOKENS - ctok0,
@@ -204,7 +191,7 @@ def main():
             'presented_order': re.findall(r'\(([A-E])\)',
                                           question.split('Options:')[-1]),
         })
-        json.dump(results, open(out_path, 'w'), indent=4)   # keep work after every question
+        json.dump(results, open(out_path, 'w'), indent=4)
 
     new = len(results) - len(done)
     print(f'\nWrote {len(results)} results to {out_path}')

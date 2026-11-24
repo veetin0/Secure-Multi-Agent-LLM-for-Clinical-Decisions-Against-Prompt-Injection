@@ -38,7 +38,6 @@ INSTRUCTION = ('You are a medical expert who conducts initial assessment and you
 
 
 def prompt_for(question):
-    # Copied from utils.determine_difficulty (upstream wording, typo included).
     return (f"Now, given the medical query as below, you need to decide the "
             f"difficulty/complexity of it:\n{question}.\n\nPlease indicate the "
             f"difficulty/complexity of the medical query among below options:\n"
@@ -50,7 +49,6 @@ def prompt_for(question):
 
 
 def upstream_label(reply):
-    # Copied from utils.determine_difficulty: the FIRST test that matches wins.
     r = reply.lower()
     if 'basic' in r or '1)' in r:
         return 'basic'
@@ -72,7 +70,7 @@ def labels_mentioned(reply):
 
 def ask(model, message, first_message=True):
     agent = Agent(instruction=INSTRUCTION, role='medical expert', model_info=model)
-    agent.chat(INSTRUCTION)            # upstream sends the instruction as a first turn too
+    agent.chat(INSTRUCTION) 
     return agent.chat(message)
 
 
@@ -80,7 +78,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--dataset', default='medqa')
     p.add_argument('--model', default='medgemma')
-    p.add_argument('--difficulty', default='adaptive')   # accepted, ignored
+    p.add_argument('--difficulty', default='adaptive')
     p.add_argument('--num_samples', type=int, default=200)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--data_root', default=None)
@@ -103,7 +101,7 @@ def main():
     for index, sample in enumerate(tqdm(test_qa[:args.num_samples])):
         if index in done:
             continue
-        random.seed(args.seed * 100000 + index)        # same option order as main.py
+        random.seed(args.seed * 100000 + index)
         question, _ = create_question(sample, args.dataset)
 
         if args.prompt == 'paper':
@@ -118,11 +116,11 @@ def main():
 
         rows.append({
             'index': index,
-            'reply': reply,                               # MDAgents' prompt, raw reply
-            'upstream_label': upstream_label(reply),      # what MDAgents routes on
+            'reply': reply,
+            'upstream_label': upstream_label(reply),
             'labels_mentioned': labels_mentioned(reply),
             'forced_reply': forced,
-            'forced_label': chosen[0] if chosen else None,  # what the model chooses
+            'forced_label': chosen[0] if chosen else None,
         })
         json.dump(rows, open(args.output, 'w'), indent=2)
 

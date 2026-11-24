@@ -14,8 +14,6 @@ This file has no dependencies so that analyze.py can use it without a model.
 
 import re
 
-# "answer is (B)", "Answer: B)", "Final Answer: **D**". The trailing
-# (?![A-Za-z]) stops the pattern matching the "A" of a following "Answer".
 STATED = re.compile(
     r'answer\s*(?:is)?\s*[:\-]?\s*\*{0,2}\s*\(?([A-E])\)?(?![A-Za-z])',
     re.IGNORECASE,
